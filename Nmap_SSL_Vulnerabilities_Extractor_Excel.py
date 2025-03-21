@@ -1,5 +1,7 @@
 import re
 import pandas as pd
+from datetime import datetime
+
 def parse_nmap_output(file_path):
     """Parses nmap ssl-enum-ciphers output to extract relevant information about SSL/TLS vulnerabilities for all hosts."""
     results = {}
@@ -24,11 +26,13 @@ def process_host(hostname, ip, host_section, results):
     """Process data for a single host."""
     port_pattern = re.compile(r"(\d+)/tcp\s+open\s+(\w+(?:-\w+)?)")
     ssl_pattern = re.compile(r"\| ssl-enum-ciphers:")
+    expiry_pattern = re.compile(r"Not valid after:\s+([\d\-:T]+)")
     
     lines = host_section.split('\n')
     current_port = None
     collecting_ssl_info = False
     ssl_info = ""
+    ssl_expiry = "Unknown"
     host_key = ip
     if host_key not in results:
         results[host_key] = {}
@@ -36,19 +40,25 @@ def process_host(hostname, ip, host_section, results):
         port_match = port_pattern.search(line)
         if port_match:
             if collecting_ssl_info and current_port:
-                process_ssl_vulnerabilities(host_key, current_port, ssl_info, results)
+                process_ssl_vulnerabilities(host_key, current_port, ssl_info, ssl_expiry, results)
             current_port = port_match.group(1)
             collecting_ssl_info = False
             ssl_info = ""
+            ssl_expiry = "Unknown"
         if ssl_pattern.search(line) and current_port:
             collecting_ssl_info = True
             ssl_info = line + "\n"
         elif collecting_ssl_info:
             ssl_info += line + "\n"
+        expiry_match = expiry_pattern.search(line)
+        if expiry_match:
+            expiry_date_str = expiry_match.group(1)
+            ssl_expiry = check_ssl_expiry(expiry_date_str)
+    
     if collecting_ssl_info and current_port:
-        process_ssl_vulnerabilities(host_key, current_port, ssl_info, results)
+        process_ssl_vulnerabilities(host_key, current_port, ssl_info, ssl_expiry, results)
 
-def process_ssl_vulnerabilities(hostname, port, ssl_info, results):
+def process_ssl_vulnerabilities(hostname, port, ssl_info, ssl_expiry, results):
     """Process SSL information for a specific port and detect vulnerabilities."""
     vulnerabilities = {
         "SWEET32": "Not Vulnerable",
@@ -57,7 +67,8 @@ def process_ssl_vulnerabilities(hostname, port, ssl_info, results):
         "FREAK": "Not Vulnerable",
         "LOGJAM": "Not Vulnerable",
         "CRIME": "Not Vulnerable",
-        "BEAST": "Not Vulnerable"
+        "BEAST": "Not Vulnerable",
+        "SSL Expiry": ssl_expiry
     }
     
     if re.search(r"(?:_3DES_|_DES_)", ssl_info, re.IGNORECASE):
@@ -87,6 +98,14 @@ def process_ssl_vulnerabilities(hostname, port, ssl_info, results):
     
     results[hostname][port] = vulnerabilities
 
+def check_ssl_expiry(expiry_date_str):
+    """Checks if the SSL certificate is expired."""
+    try:
+        expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%dT%H:%M:%S")
+        return "Expired" if expiry_date < datetime.utcnow() else "Not Expired"
+    except ValueError:
+        return "Unknown"
+
 def generate_report(results, output_file):
     """Generates an Excel report of detected vulnerabilities."""
     data = []
@@ -99,7 +118,7 @@ def generate_report(results, output_file):
     
     if data:
         df = pd.DataFrame(data)
-        column_order = ["IP/Domain", "SWEET32", "POODLE", "DROWN", "FREAK", "LOGJAM", "CRIME", "BEAST"]
+        column_order = ["IP/Domain", "SWEET32", "POODLE", "DROWN", "FREAK", "LOGJAM", "CRIME", "BEAST", "SSL Expiry"]
         df = df[column_order]
         df.to_excel(output_file, index=False)
         print(f"Report successfully saved to {output_file}")
