@@ -3,9 +3,7 @@ import pandas as pd
 from datetime import datetime
 
 def parse_nmap_output(file_path):
-    """Parses nmap ssl-enum-ciphers output to extract relevant information about SSL/TLS vulnerabilities for all hosts."""
     results = {}
-   
     with open(file_path, "r", encoding="utf-8") as file:
         content = file.read()
     host_pattern = re.compile(r"Nmap scan report for ([\w\.-]+)(?: \((\d+\.\d+\.\d+\.\d+)\))?")
@@ -23,9 +21,8 @@ def parse_nmap_output(file_path):
     return results
 
 def process_host(hostname, ip, host_section, results):
-    """Process data for a single host."""
     port_pattern = re.compile(r"(\d+)/tcp\s+open\s+(\w+(?:-\w+)?)")
-    ssl_pattern = re.compile(r"\| ssl-enum-ciphers:")
+    ssl_pattern = re.compile(r"\| ssl-enum-ciphers:|ssl-cert:")
     expiry_pattern = re.compile(r"Not valid after:\s+([\d\-:T]+)")
     
     lines = host_section.split('\n')
@@ -59,7 +56,6 @@ def process_host(hostname, ip, host_section, results):
         process_ssl_vulnerabilities(host_key, current_port, ssl_info, ssl_expiry, results)
 
 def process_ssl_vulnerabilities(hostname, port, ssl_info, ssl_expiry, results):
-    """Process SSL information for a specific port and detect vulnerabilities."""
     vulnerabilities = {
         "SWEET32": "Not Vulnerable",
         "POODLE": "Not Vulnerable",
@@ -68,7 +64,8 @@ def process_ssl_vulnerabilities(hostname, port, ssl_info, ssl_expiry, results):
         "LOGJAM": "Not Vulnerable",
         "CRIME": "Not Vulnerable",
         "BEAST": "Not Vulnerable",
-        "SSL Expiry": ssl_expiry
+        "SSL Expiry": ssl_expiry,
+        "Deprecated Protocols": "Not Deprecated"
     }
     
     if re.search(r"(?:_3DES_|_DES_)", ssl_info, re.IGNORECASE):
@@ -96,10 +93,12 @@ def process_ssl_vulnerabilities(hostname, port, ssl_info, ssl_expiry, results):
     if re.search(r"TLSv1\.0:.*?_CBC_", ssl_info, re.DOTALL):
         vulnerabilities["BEAST"] = "VULNERABLE - CBC ciphers with TLSv1.0"
     
+    if re.search(r"SSLv3|TLSv1\.0|TLSv1\.1", ssl_info, re.IGNORECASE):
+        vulnerabilities["Deprecated Protocols"] = "Deprecated"
+    
     results[hostname][port] = vulnerabilities
 
 def check_ssl_expiry(expiry_date_str):
-    """Checks if the SSL certificate is expired."""
     try:
         expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%dT%H:%M:%S")
         return "Expired" if expiry_date < datetime.utcnow() else "Not Expired"
@@ -107,9 +106,7 @@ def check_ssl_expiry(expiry_date_str):
         return "Unknown"
 
 def generate_report(results, output_file):
-    """Generates an Excel report of detected vulnerabilities."""
     data = []
-    
     for host, ports in results.items():
         for port, vulnerabilities in ports.items():
             row = {"IP/Domain": f"{host}:{port}"}
@@ -118,7 +115,7 @@ def generate_report(results, output_file):
     
     if data:
         df = pd.DataFrame(data)
-        column_order = ["IP/Domain", "SWEET32", "POODLE", "DROWN", "FREAK", "LOGJAM", "CRIME", "BEAST", "SSL Expiry"]
+        column_order = ["IP/Domain", "SWEET32", "POODLE", "DROWN", "FREAK", "LOGJAM", "CRIME", "BEAST", "SSL Expiry", "Deprecated Protocols"]
         df = df[column_order]
         df.to_excel(output_file, index=False)
         print(f"Report successfully saved to {output_file}")
@@ -134,12 +131,9 @@ if __name__ == "__main__":
     try:
         file_path = input("Enter the path to the Nmap output file: ")
         output_file = input("Enter the path for the Excel output file (default: Nmap_SSL_vulnerabilities.xlsx): ")
-        
         if not output_file:
             output_file = "Nmap_SSL_vulnerabilities.xlsx"
-        
         results = parse_nmap_output(file_path)
-        
         if results and any(results.values()):
             generate_report(results, output_file)
         else:
