@@ -1,109 +1,129 @@
 import re
 import pandas as pd
-import sys
-import os
-
-def parse_nmap_output(file_path, debug=False):
+def parse_nmap_output(file_path):
+    """Parses nmap ssl-enum-ciphers output to extract relevant information about SSL/TLS vulnerabilities for all hosts."""
     results = {}
-    debug_info = {}
-
+   
     with open(file_path, "r", encoding="utf-8") as file:
         content = file.read()
-
     host_pattern = re.compile(r"Nmap scan report for ([\w\.-]+)(?: \((\d+\.\d+\.\d+\.\d+)\))?")
-    port_pattern = re.compile(r"(\d+)/tcp\s+open\s+(\w+(?:-\w+)?)")
-    ssl_enum_pattern = re.compile(r"\|\s+ssl-enum-ciphers:")
-
-    host_matches = list(host_pattern.finditer(content))
-    for i, host_match in enumerate(host_matches):
+    host_matches = host_pattern.finditer(content)
+    
+    for host_match in host_matches:
         hostname = host_match.group(1)
         ip = host_match.group(2) if host_match.group(2) else hostname
-        start_pos = host_match.end()
-        end_pos = host_matches[i + 1].start() if i + 1 < len(host_matches) else len(content)
+        start_pos = host_match.start()
+        next_match = host_pattern.search(content, host_match.end())
+        end_pos = next_match.start() if next_match else len(content)
         host_section = content[start_pos:end_pos]
-
-        results[ip] = {}
-        debug_info[ip] = {}
-        
-        current_port = None
-        collecting_ssl_info = False
-        ssl_info = ""
-
-        for line in host_section.split('\n'):
-            port_match = port_pattern.search(line)
-            if port_match:
-                if collecting_ssl_info and current_port:
-                    process_ssl_vulnerabilities(ip, current_port, ssl_info, results, debug_info)
-                current_port = port_match.group(1)
-                collecting_ssl_info = False
-                ssl_info = ""
-
-            if ssl_enum_pattern.search(line) and current_port:
-                collecting_ssl_info = True
-                ssl_info = line + "\n"
-            elif collecting_ssl_info:
-                ssl_info += line + "\n"
-
-        if collecting_ssl_info and current_port:
-            process_ssl_vulnerabilities(ip, current_port, ssl_info, results, debug_info)
-
-    return results, debug_info
-
-def process_ssl_vulnerabilities(ip, port, ssl_info, results, debug_info):
-    vulnerabilities = {}
-    ssl_info_lower = ssl_info.lower()
+        process_host(hostname, ip, host_section, results)
     
-    vulnerability_checks = {
-        "SWEET32": ["3des", "des-cbc3", "des-cbc", "triple-des", "des3"],
-        "POODLE": ["sslv3", "ssl v3"],
-        "DROWN": ["sslv2", "ssl v2"],
-        "FREAK": ["export", "exp-", "exp_", "export-"],
-        "CRIME": ["compression: enabled", "compressors:"],
+    return results
+
+def process_host(hostname, ip, host_section, results):
+    """Process data for a single host."""
+    port_pattern = re.compile(r"(\d+)/tcp\s+open\s+(\w+(?:-\w+)?)")
+    ssl_pattern = re.compile(r"\| ssl-enum-ciphers:")
+    
+    lines = host_section.split('\n')
+    current_port = None
+    collecting_ssl_info = False
+    ssl_info = ""
+    host_key = ip
+    if host_key not in results:
+        results[host_key] = {}
+    for i, line in enumerate(lines):
+        port_match = port_pattern.search(line)
+        if port_match:
+            if collecting_ssl_info and current_port:
+                process_ssl_vulnerabilities(host_key, current_port, ssl_info, results)
+            current_port = port_match.group(1)
+            collecting_ssl_info = False
+            ssl_info = ""
+        if ssl_pattern.search(line) and current_port:
+            collecting_ssl_info = True
+            ssl_info = line + "\n"
+        elif collecting_ssl_info:
+            ssl_info += line + "\n"
+    if collecting_ssl_info and current_port:
+        process_ssl_vulnerabilities(host_key, current_port, ssl_info, results)
+
+def process_ssl_vulnerabilities(hostname, port, ssl_info, results):
+    """Process SSL information for a specific port and detect vulnerabilities."""
+    vulnerabilities = {
+        "SWEET32": "Not Vulnerable",
+        "POODLE": "Not Vulnerable",
+        "DROWN": "Not Vulnerable",
+        "FREAK": "Not Vulnerable",
+        "LOGJAM": "Not Vulnerable",
+        "CRIME": "Not Vulnerable",
+        "BEAST": "Not Vulnerable"
     }
     
-    for vuln, patterns in vulnerability_checks.items():
-        if any(pattern in ssl_info_lower for pattern in patterns):
-            vulnerabilities[vuln] = "VULNERABLE"
+    if re.search(r"(?:_3DES_|_DES_)", ssl_info, re.IGNORECASE):
+        vulnerabilities["SWEET32"] = "VULNERABLE - Uses 64-bit block cipher (3DES/DES)"
     
-    dh_matches = re.findall(r"(?:dh|diffie.hellman).{0,20}?(\d+)\s*bits?", ssl_info_lower)
+    if re.search(r"SSLv3:", ssl_info, re.IGNORECASE):
+        vulnerabilities["POODLE"] = "VULNERABLE - SSLv3 is enabled"
+    
+    if re.search(r"SSLv2:", ssl_info, re.IGNORECASE):
+        vulnerabilities["DROWN"] = "VULNERABLE - SSLv2 is enabled"
+    
+    if re.search(r"(?:_EXPORT_|_EXP_)", ssl_info, re.IGNORECASE):
+        vulnerabilities["FREAK"] = "VULNERABLE - Export-grade ciphers enabled"
+    
+    dh_matches = re.findall(r"dh (\d+)", ssl_info)
     for dh_size in dh_matches:
         if int(dh_size) < 2048:
-            vulnerabilities["LOGJAM"] = f"VULNERABLE - Weak {dh_size}-bit DH"
+            vulnerabilities["LOGJAM"] = f"VULNERABLE - DHE using weak {dh_size}-bit parameters"
             break
     
-    has_tlsv1 = "tlsv1.0" in ssl_info_lower or "tls v1.0" in ssl_info_lower
-    has_cbc = "cbc" in ssl_info_lower
-    tlsv1_section = re.search(r"TLSv1\.0[^]*(.*?)(?:\w|\Z)", ssl_info, re.DOTALL | re.IGNORECASE)
-    has_cbc_in_tlsv1 = "cbc" in tlsv1_section.group(1).lower() if tlsv1_section else False
+    compression_section = re.search(r"compressors:\s*\n(.*?)\n", ssl_info)
+    if compression_section and "NULL" not in compression_section.group(1):
+        vulnerabilities["CRIME"] = "VULNERABLE - TLS compression is enabled"
     
-    if has_tlsv1 and has_cbc_in_tlsv1:
+    if re.search(r"TLSv1\.0:.*?_CBC_", ssl_info, re.DOTALL):
         vulnerabilities["BEAST"] = "VULNERABLE - CBC ciphers with TLSv1.0"
     
-    results[ip][port] = vulnerabilities
-    debug_info[ip][port] = {
-        "raw_ssl_info": ssl_info, 
-        "detected_vulnerabilities": vulnerabilities,
-        "cipher_checks": {
-            "has_tlsv1": has_tlsv1,
-            "has_cbc": has_cbc,
-            "has_cbc_in_tlsv1": has_cbc_in_tlsv1
-        }
-    }
+    results[hostname][port] = vulnerabilities
 
 def generate_report(results, output_file):
+    """Generates an Excel report of detected vulnerabilities."""
     data = []
+    
     for host, ports in results.items():
         for port, vulnerabilities in ports.items():
             row = {"IP/Domain": f"{host}:{port}"}
             row.update(vulnerabilities)
             data.append(row)
     
-    df = pd.DataFrame(data)
-    df.to_excel(output_file, index=False)
-    print(f"Report saved: {output_file}")
+    if data:
+        df = pd.DataFrame(data)
+        column_order = ["IP/Domain", "SWEET32", "POODLE", "DROWN", "FREAK", "LOGJAM", "CRIME", "BEAST"]
+        df = df[column_order]
+        df.to_excel(output_file, index=False)
+        print(f"Report successfully saved to {output_file}")
+        print(f"\nFound {len(data)} SSL/TLS services across {len(results)} hosts")
+        for host in results:
+            print(f"  - {host}: {len(results[host])} SSL/TLS services")
+        return True
+    else:
+        print("No SSL/TLS services found in the scan results")
+        return False
 
 if __name__ == "__main__":
-    file_path = input("Enter the Nmap output file: ")
-    output_file = input("Enter Excel output file (default: Nmap_SSL_vulnerabilities.xlsx): ") or "Nmap_SSL_vulnerabilities.xlsx"
-    results, debug_info = parse_nmap_output(file_path, debug=True)
-    generate_report(results, output_file)
+    try:
+        file_path = input("Enter the path to the Nmap output file: ")
+        output_file = input("Enter the path for the Excel output file (default: Nmap_SSL_vulnerabilities.xlsx): ")
+        
+        if not output_file:
+            output_file = "Nmap_SSL_vulnerabilities.xlsx"
+        
+        results = parse_nmap_output(file_path)
+        
+        if results and any(results.values()):
+            generate_report(results, output_file)
+        else:
+            print("No SSL/TLS services found in the scan results")
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
